@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfy-bridge"
+version = "0.1.0"
+description = "Run ComfyUI's shipped nodes in-process, without the web UI."
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Deliberately empty. ComfyUI's own requirements.txt is installed into the target
+# conda env (gygax) as a separate step — see spec §10. Pinning them here would
+# fight with the env that actually has to satisfy torch.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/nkolkin13/comfy-bridge"
+
+[tool.setuptools]
+packages = ["comfy_bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

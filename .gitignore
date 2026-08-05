@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Run outputs and model weights (never commit these; scoped so docs/ images
+# stay committable)
+out/
+outputs/
+*.safetensors
+*.ckpt
+*.pt
