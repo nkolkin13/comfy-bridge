@@ -1,12 +1,12 @@
-"""Ordering-critical ComfyUI startup (spec §5.1).
+"""Ordering-critical ComfyUI startup (§5.1).
 
 This is the only module in the package that touches ``sys.path`` or imports
-ComfyUI. Every step below is ordered against a constraint recorded in the spec;
+ComfyUI. Every step below is ordered against a constraint recorded in CLAUDE.md;
 reordering them will fail in ways that are quiet rather than loud.
 
 Deliberately imports no third-party modules at module scope — in particular not
 torch, because the device environment variables in step 1 only take effect if
-they are set before torch is first imported (spec C4).
+they are set before torch is first imported (C4).
 """
 
 from __future__ import annotations
@@ -27,10 +27,10 @@ log = logging.getLogger("comfy_bridge")
 
 DEFAULT_COMFY_ROOT = "/home/nick/Projects/ComfyUI"
 
-#: ComfyUI version this package was last validated against (spec §10).
+#: ComfyUI version this package was last validated against (§10).
 VALIDATED_COMFY_VERSION = "0.30.0"
 
-#: The only top-level ComfyUI modules Tier 2.5 is allowed to introduce (spec C10).
+#: The only top-level ComfyUI modules Tier 2.5 is allowed to introduce (C10).
 #:
 #: Measured empirically by running start(), not by static grep. The original
 #: 13-name survey covered nodes.py, comfy_extras/, comfy_execution/ and
@@ -73,6 +73,16 @@ FOOTPRINT_REAL_SERVER = FOOTPRINT | {
 #: Footprint members that legitimately may not appear.
 OPTIONAL_FOOTPRINT = frozenset({"cuda_malloc"})
 
+#: Top-level names the bridge itself puts into sys.modules, as opposed to ones
+#: ComfyUI introduces. The stub server (D9) is not a file under the checkout, so
+#: _comfy_top_level_modules cannot see it and the footprint guard would otherwise
+#: be blind to the one name this package injects. It stays installed for the
+#: process lifetime: comfy_api/latest/__init__.py:31 holds a *deferred*
+#: ``from server import PromptServer``, and by the time it fires sys.path no
+#: longer contains the checkout, so removing the stub would turn that into an
+#: ImportError with no fallback.
+INJECTED = frozenset({"server"})
+
 VRAM_MODES = ("normal", "highvram", "lowvram", "novram", "cpu", "gpu-only")
 
 # Files that must exist for a directory to plausibly be a ComfyUI checkout.
@@ -89,6 +99,8 @@ class Runtime:
     nodes: dict[str, Any] = field(repr=False, default_factory=dict)
     display_names: dict[str, str] = field(repr=False, default_factory=dict)
     footprint: frozenset[str] = frozenset()
+    #: Top-level names this package injected rather than ComfyUI (see INJECTED).
+    injected: frozenset[str] = frozenset()
     dynamic_vram: bool = False
     progress_callback: Callable[[str, Any, Any], None] | None = None
 
@@ -96,8 +108,30 @@ class Runtime:
         return len(self.nodes)
 
 
+@dataclass
+class _Loaded:
+    """What the load phase produced. At most one of these exists per process.
+
+    Recorded *before* the footprint guard runs, so that a start() which loads
+    ComfyUI successfully and then trips the guard can be retried with different
+    validation settings without re-running any of the load steps — several of
+    which (comfy-aimdo's two-stage init, init_extra_nodes) are not idempotent,
+    and one of which (the device env vars) can never be applied twice because
+    torch is imported in between.
+    """
+
+    root: Path
+    loop: Any
+    server: Any
+    nodes_module: Any
+    holder: dict[str, Runtime]
+    dynamic_vram: bool
+    config: dict[str, Any]
+
+
 _RUNTIME: Runtime | None = None
 _START_CONFIG: dict[str, Any] | None = None
+_LOADED: _Loaded | None = None
 
 
 def _resolve_root(explicit: str | os.PathLike[str] | None) -> Path:
@@ -114,7 +148,7 @@ def _resolve_root(explicit: str | os.PathLike[str] | None) -> Path:
 
 
 def _check_version(root: Path) -> None:
-    """Warn — never fail — when the checkout has moved (spec §10)."""
+    """Warn — never fail — when the checkout has moved (§10)."""
     version_file = root / "comfyui_version.py"
     try:
         text = version_file.read_text(encoding="utf-8")
@@ -136,7 +170,7 @@ def _check_version(root: Path) -> None:
 
 
 def _set_device_env(device: int | str | None) -> None:
-    """Step 1 — must precede any torch import (spec C4, mirrors main.py:83-93)."""
+    """Step 1 — must precede any torch import (C4, mirrors main.py:83-93)."""
     if device is None:
         return
     if "torch" in sys.modules:
@@ -261,7 +295,7 @@ def _configure_args(
     reserve_vram: float | None,
     disable_nvml_pressure: bool,
 ) -> None:
-    """Step 3 — mutate cli_args.args before model_management imports it (spec C5)."""
+    """Step 3 — mutate cli_args.args before model_management imports it (C5)."""
     if vram_mode not in VRAM_MODES:
         raise BootstrapError(f"vram_mode must be one of {VRAM_MODES}, got {vram_mode!r}")
 
@@ -330,7 +364,7 @@ def _configure_folder_paths(
 
 
 def _install_progress_hook(server: Any, runtime_holder: dict[str, Runtime]) -> None:
-    """Step 7 — replace send_sync (spec C12).
+    """Step 7 — replace send_sync (C12).
 
     PromptServer.send_sync schedules onto the event loop via call_soon_threadsafe
     (server.py:1392-1394). Our loop never runs, so those callbacks would pile up
@@ -387,6 +421,151 @@ def _comfy_top_level_modules(root: Path) -> set[str]:
     return found
 
 
+def _load_comfyui(config: dict[str, Any]) -> _Loaded:
+    """Steps 1-10 of §5.1: everything that mutates the process.
+
+    Runs at most once per process. Raises BootstrapError on any failure, having
+    removed the sys.path entry first.
+    """
+    use_real_server = config["use_real_server"]
+
+    # 1. device env vars, before torch exists
+    _set_device_env(config["device"])
+
+    # 2. path insert
+    root = _resolve_root(config["comfy_root"])
+    _check_version(root)
+    root_str = str(root)
+    sys.path.insert(0, root_str)
+
+    try:
+        # 3. args, before model_management reads them
+        _configure_args(
+            config["vram_mode"],
+            config["deterministic"],
+            config["dynamic_vram"],
+            config["reserve_vram"],
+            config["disable_nvml_pressure"],
+        )
+
+        # 3b. dynamic VRAM (main.py:58-70) — must precede model_management
+        dynamic_vram_active = _init_dynamic_vram()
+
+        # 4. cuda_malloc, mirroring main.py's conditional application
+        from comfy.cli_args import args as _args
+
+        if not _args.cpu and not _args.disable_cuda_malloc:
+            if "torch" in sys.modules:
+                # cuda_malloc sets PYTORCH_CUDA_ALLOC_CONF at import. torch parses
+                # that once, at ITS import — changing it afterwards makes the
+                # first CUDA init abort with "Allocator backend parsed at runtime
+                # != allocator backend parsed at load time". main.py never hits
+                # this because it imports cuda_malloc first; a library caller
+                # (or a generated module with `import torch` at the top) can't
+                # make that guarantee, so skip rather than crash.
+                log.debug("torch already imported; skipping cuda_malloc")
+            else:
+                try:
+                    import cuda_malloc  # noqa: F401
+                except Exception as exc:  # non-fatal, as upstream treats it
+                    log.debug("cuda_malloc unavailable: %r", exc)
+
+        # 5. folder paths
+        _configure_folder_paths(
+            root,
+            config["models_dir"],
+            config["output_dir"],
+            config["temp_dir"],
+            config["input_dir"],
+            config["extra_model_paths"],
+        )
+
+        # 5b. the half of dynamic VRAM that needs model_management loaded
+        #     (main.py:251-282). This is what actually sets aimdo_enabled.
+        if dynamic_vram_active:
+            dynamic_vram_active = _enable_dynamic_vram_devices(config["vram_headroom"])
+
+        # 6. PromptServer. The stub satisfies the only three importers
+        #    (nodes_images, nodes_gaussian_splat, comfy_api.latest) without
+        #    dragging in server/app/api_server/middleware/utils/comfyui_version
+        #    or aiohttp. The real one is available as an escape hatch.
+        holder: dict[str, Runtime] = {}
+        loop = asyncio.new_event_loop()
+        if use_real_server:
+            import server as comfy_server
+
+            prompt_server = comfy_server.PromptServer(loop)
+            # 7. neutralise send_sync — the real one queues onto a loop that
+            #    never runs (C12).
+            _install_progress_hook(prompt_server, holder)
+        else:
+            prompt_server = _stub_server.install()
+            _install_stub_progress_hook(prompt_server, holder)
+
+        # 8. shipped nodes only — no custom nodes, no API nodes (C8/C9)
+        import nodes as comfy_nodes
+
+        loop.run_until_complete(
+            comfy_nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False)
+        )
+
+        # 9. eagerly import the footprint so the deferred imports at
+        #    comfy_api/latest/__init__.py:31, comfy_execution/caching.py:303 and
+        #    comfy_execution/asset_enrichment.py:18-19 resolve from sys.modules
+        #    once the path entry is gone (C11).
+        expected = FOOTPRINT_REAL_SERVER if use_real_server else FOOTPRINT
+        for name in sorted(expected):
+            if name == "cuda_malloc" and "cuda_malloc" not in sys.modules:
+                continue  # skipped on CPU-only or --disable-cuda-malloc
+            __import__(name)
+
+    except BootstrapError:
+        _remove_path(root_str)
+        raise
+    except Exception as exc:
+        _remove_path(root_str)
+        raise BootstrapError(f"ComfyUI failed to start from {root}: {exc!r}") from exc
+
+    # 10. drop the path entry; package submodules resolve via __path__ from here
+    _remove_path(root_str)
+
+    return _Loaded(
+        root=root,
+        loop=loop,
+        server=prompt_server,
+        nodes_module=comfy_nodes,
+        holder=holder,
+        dynamic_vram=dynamic_vram_active,
+        config=config,
+    )
+
+
+def _check_footprint(root: Path, use_real_server: bool) -> frozenset[str]:
+    """Step 11 — assert the namespace footprint, returning what was introduced."""
+    expected = FOOTPRINT_REAL_SERVER if use_real_server else FOOTPRINT
+    introduced = _comfy_top_level_modules(root)
+    unexpected = introduced - expected
+    # cuda_malloc is skipped on CPU, with --disable-cuda-malloc, or when torch
+    # was already imported (see step 4), so its absence is not a regression.
+    missing = expected - introduced - OPTIONAL_FOOTPRINT
+
+    # The stub is not a file under the checkout, so the scan above cannot see
+    # it. Check it explicitly rather than leave the one name we inject
+    # unguarded — if something replaced sys.modules['server'] after startup,
+    # the three importers that bound PromptServer at module scope are now
+    # pointing at a different class than anything importing it later.
+    if not use_real_server:
+        installed = sys.modules.get(_stub_server.MODULE_NAME)
+        if installed is None:
+            missing = missing | {_stub_server.MODULE_NAME}
+        elif not getattr(installed, "__comfy_bridge_stub__", False):
+            unexpected = unexpected | {_stub_server.MODULE_NAME}
+
+    if unexpected or missing:
+        raise NamespaceError(unexpected, missing)
+    return frozenset(introduced)
+
+
 def start(
     comfy_root: str | os.PathLike[str] | None = None,
     *,
@@ -412,8 +591,14 @@ def start(
     returns the existing Runtime, and calling it with a different one raises.
     ComfyUI keeps module-level state (NODE_CLASS_MAPPINGS, PromptServer.instance,
     model_management's device state) that cannot be meaningfully re-initialised.
+
+    Runs in two phases. The **load** phase (§5.1 steps 1-10) mutates the process
+    and happens at most once. The **validate** phase (step 11, the footprint
+    guard) is re-runnable, so a call that loaded ComfyUI and then tripped the
+    guard can be retried with ``enforce_footprint=False`` — which is the advice
+    NamespaceError gives, and which only works because the retry skips loading.
     """
-    global _RUNTIME, _START_CONFIG
+    global _RUNTIME, _START_CONFIG, _LOADED
 
     config = {
         "comfy_root": str(comfy_root) if comfy_root else None,
@@ -442,120 +627,47 @@ def start(
         _RUNTIME.progress_callback = progress_callback
         return _RUNTIME
 
-    # 1. device env vars, before torch exists
-    _set_device_env(device)
+    if _LOADED is not None:
+        # A previous start() completed the load phase and then failed — almost
+        # always at the footprint guard, which is exactly when you want to retry
+        # with enforce_footprint=False. Reuse what was loaded: re-running the
+        # load phase would re-init comfy-aimdo and, if device= was given, fail on
+        # the torch-already-imported check against torch that *we* imported.
+        if config != _LOADED.config:
+            raise BootstrapError(
+                "ComfyUI is already loaded in this process from an earlier "
+                "start() that did not complete, and it was loaded with a "
+                "different configuration. Load-time settings (device, "
+                "vram_mode, comfy_root, ...) are baked in once torch and "
+                "model_management are imported and cannot be changed without a "
+                "new process. Retry with the original arguments, or restart."
+            )
+        loaded = _LOADED
+    else:
+        loaded = _load_comfyui(config)
+        _LOADED = loaded
 
-    # 2. path insert
-    root = _resolve_root(comfy_root)
-    _check_version(root)
-    root_str = str(root)
-    before = set(sys.modules)
-    sys.path.insert(0, root_str)
-
-    try:
-        # 3. args, before model_management reads them
-        _configure_args(
-            vram_mode, deterministic, dynamic_vram, reserve_vram, disable_nvml_pressure
-        )
-
-        # 3b. dynamic VRAM (main.py:58-70) — must precede model_management
-        dynamic_vram_active = _init_dynamic_vram()
-
-        # 4. cuda_malloc, mirroring main.py's conditional application
-        from comfy.cli_args import args as _args
-
-        if not _args.cpu and not _args.disable_cuda_malloc:
-            if "torch" in sys.modules:
-                # cuda_malloc sets PYTORCH_CUDA_ALLOC_CONF at import. torch parses
-                # that once, at ITS import — changing it afterwards makes the
-                # first CUDA init abort with "Allocator backend parsed at runtime
-                # != allocator backend parsed at load time". main.py never hits
-                # this because it imports cuda_malloc first; a library caller
-                # (or a generated module with `import torch` at the top) can't
-                # make that guarantee, so skip rather than crash.
-                log.debug("torch already imported; skipping cuda_malloc")
-            else:
-                try:
-                    import cuda_malloc  # noqa: F401
-                except Exception as exc:  # non-fatal, as upstream treats it
-                    log.debug("cuda_malloc unavailable: %r", exc)
-
-        # 5. folder paths
-        _configure_folder_paths(
-            root, models_dir, output_dir, temp_dir, input_dir, extra_model_paths
-        )
-
-        # 5b. the half of dynamic VRAM that needs model_management loaded
-        #     (main.py:251-282). This is what actually sets aimdo_enabled.
-        if dynamic_vram_active:
-            dynamic_vram_active = _enable_dynamic_vram_devices(vram_headroom)
-
-        # 6. PromptServer. The stub satisfies the only three importers
-        #    (nodes_images, nodes_gaussian_splat, comfy_api.latest) without
-        #    dragging in server/app/api_server/middleware/utils/comfyui_version
-        #    or aiohttp. The real one is available as an escape hatch.
-        holder: dict[str, Runtime] = {}
-        if use_real_server:
-            import server as comfy_server
-
-            loop = asyncio.new_event_loop()
-            prompt_server = comfy_server.PromptServer(loop)
-            # 7. neutralise send_sync — the real one queues onto a loop that
-            #    never runs (spec C12).
-            _install_progress_hook(prompt_server, holder)
-        else:
-            loop = asyncio.new_event_loop()
-            prompt_server = _stub_server.install()
-            _install_stub_progress_hook(prompt_server, holder)
-
-        # 8. shipped nodes only — no custom nodes, no API nodes (spec C8/C9)
-        import nodes as comfy_nodes
-
-        loop.run_until_complete(
-            comfy_nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False)
-        )
-
-        # 9. eagerly import the footprint so the deferred imports at
-        #    comfy_api/latest/__init__.py:31, comfy_execution/caching.py:303 and
-        #    comfy_execution/asset_enrichment.py:18-19 resolve from sys.modules
-        #    once the path entry is gone (spec C11).
-        expected = FOOTPRINT_REAL_SERVER if use_real_server else FOOTPRINT
-        for name in sorted(expected):
-            if name == "cuda_malloc" and "cuda_malloc" not in sys.modules:
-                continue  # skipped on CPU-only or --disable-cuda-malloc
-            __import__(name)
-
-    except BootstrapError:
-        _remove_path(root_str)
-        raise
-    except Exception as exc:
-        _remove_path(root_str)
-        raise BootstrapError(f"ComfyUI failed to start from {root}: {exc!r}") from exc
-
-    # 10. drop the path entry; package submodules resolve via __path__ from here
-    _remove_path(root_str)
+    root = loaded.root
 
     # 11. footprint guard
-    expected = FOOTPRINT_REAL_SERVER if use_real_server else FOOTPRINT
-    introduced = _comfy_top_level_modules(root)
-    unexpected = introduced - expected
-    # cuda_malloc is skipped on CPU, with --disable-cuda-malloc, or when torch
-    # was already imported (see step 4), so its absence is not a regression.
-    missing = expected - introduced - OPTIONAL_FOOTPRINT
-    if enforce_footprint and (unexpected or missing):
-        raise NamespaceError(unexpected, missing)
+    if enforce_footprint:
+        introduced = _check_footprint(root, use_real_server)
+    else:
+        introduced = frozenset(_comfy_top_level_modules(root))
 
+    comfy_nodes = loaded.nodes_module
     runtime = Runtime(
         root=root,
-        loop=loop,
-        server=prompt_server,
+        loop=loaded.loop,
+        server=loaded.server,
         nodes=dict(comfy_nodes.NODE_CLASS_MAPPINGS),
         display_names=dict(comfy_nodes.NODE_DISPLAY_NAME_MAPPINGS),
-        footprint=frozenset(introduced),
-        dynamic_vram=dynamic_vram_active,
+        footprint=introduced,
+        injected=frozenset() if use_real_server else INJECTED,
+        dynamic_vram=loaded.dynamic_vram,
         progress_callback=progress_callback,
     )
-    holder["runtime"] = runtime
+    loaded.holder["runtime"] = runtime
     _RUNTIME = runtime
     _START_CONFIG = config
     log.info(
@@ -564,8 +676,6 @@ def start(
         len(runtime.nodes),
         len(introduced),
     )
-    unused = set(before)  # kept for debugging symmetry; not part of the guard
-    del unused
     return runtime
 
 

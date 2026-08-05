@@ -1,4 +1,4 @@
-"""M0 tests — the cheap guards from spec §11.
+"""M0 tests — the cheap guards from §11.
 
 These are the tests that make an upstream ComfyUI bump fail loudly at CI rather
 than silently at runtime.
@@ -93,7 +93,7 @@ def test_polluting_names_stay_absent(runtime):
     `tests` is the one that would break pytest collection in a host project;
     `sample`/`sd`/`options`/`float` would arrive only via the sys.path[0] insert
     at nodes.py:2334, which lives inside init_external_custom_nodes and
-    therefore never runs for us (spec C9).
+    therefore never runs for us (C9).
     """
     for name in ("tests", "sample", "sd", "options", "float", "ops", "conds"):
         module = sys.modules.get(name)

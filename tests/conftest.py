@@ -36,8 +36,6 @@ def busy_gpu_message(used: int, override: str = OVERRIDE_ENV) -> str:
         "Wait until the card is idle and run the suite then, or if you know it is\n"
         "safe:\n"
         f"    {override}=1 pytest tests/\n"
-        "\n"
-        "(comfy-accel's suite is CPU-only and is always safe to run.)"
     )
 
 

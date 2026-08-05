@@ -19,7 +19,7 @@ Full list is pinned in `comfy-codegen/tests/test_roundtrip.py`.
 
 ## Correcting the record
 
-The spec originally claimed **zero** shipped nodes used list I/O (C17), which
+CLAUDE.md originally claimed **zero** shipped nodes used list I/O (C17), which
 made skipping `_map_node_over_list` look free. That was wrong, and it's worth
 understanding why so the mistake isn't repeated:
 

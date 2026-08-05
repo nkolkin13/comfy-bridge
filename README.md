@@ -52,7 +52,10 @@ would fight with the environment that actually has to satisfy ComfyUI.
 
 ```bash
 pip install -e '.[dev]'
+git config core.hooksPath .githooks   # enable the pre-push test hook
 ```
+
+The hook path is local git config, so it has to be set once per clone.
 
 The ComfyUI checkout is located in this order:
 
@@ -137,34 +140,52 @@ the call is under `inference_mode`.
 pytest
 ```
 
-63 tests. The suite starts ComfyUI and allocates real VRAM, so it refuses to run
-while the GPU is busy — a skip would report green while covering nothing.
-Override with `COMFY_BRIDGE_ALLOW_BUSY_GPU=1` when you know it is safe.
+69 tests, about five seconds. The suite starts ComfyUI and allocates real VRAM,
+so it refuses to run while the GPU is busy — a skip would report green while
+covering nothing. Override with `COMFY_BRIDGE_ALLOW_BUSY_GPU=1` when you know it
+is safe.
 
-The cheap guards (`sys.modules` delta, no torch at import, clean `sys.path`, no
-port bound, no ComfyUI mutation) run on every commit.
+A pre-push hook runs the suite in the `gygax` conda env, warns on any test
+slower than 1s and fails on any slower than 5s. `git push --no-verify` bypasses
+it.
 
 ## Documentation
 
 | | |
 |---|---|
-| [`docs/spec.md`](docs/spec.md) | The authoritative design record — decisions D1–D13, measured constraints C1–C38, milestones. Read this first. |
+| [`CLAUDE.md`](CLAUDE.md) | The operative record — decisions, measured constraints, bootstrap ordering, and the rules for changing this code. Read this first. |
 | [`docs/extending.md`](docs/extending.md) | Adding local nodes and patches without polluting the checkout. |
 | [`backlog/`](backlog/) | Deferred work, one file per item. |
 
-Two constraints in the spec were wrong in earlier drafts and were only caught by
-running code, which is worth generalising: **grep the source to find things,
-measure the registry to make claims.**
+Two constraints were wrong in earlier drafts and were only caught by running
+code, which is worth generalising: **grep the source to find things, measure the
+registry to make claims.**
 
 ## Status
 
-M0–M3 complete: bootstrap, the `invoke()` shim, and codegen parse/emit/coverage
-(564 of 591 shipped nodes codegen; the 27 list-I/O nodes raise
-`UnsupportedNodeError`). M4 — the golden-file and CPU-execution suite that makes
-an upstream ComfyUI bump fail loudly — is
-[deferred](backlog/m4-golden-suite.md) and is the highest-priority item.
+| Milestone | State |
+|---|---|
+| M0 — bootstrap | done |
+| M1 — `invoke()` shim + memory control | done |
+| M2 — codegen parse + emit | done, verified end-to-end on MiniMax H3 |
+| M3 — codegen coverage | done — 564/591 nodes codegen, 27 unsupported, 0 unexplained |
+| M4 — golden suite | **deferred** → [`backlog/m4-golden-suite.md`](backlog/m4-golden-suite.md) |
 
 Third-party custom nodes are permanently out of scope.
+
+## Backlog
+
+Deferred work, one file per item. Read `CLAUDE.md` before picking anything up —
+several items exist *because* of a specific constraint, and the reasoning is
+what a one-line summary loses.
+
+| File | What | Priority |
+|---|---|---|
+| [`m4-golden-suite.md`](backlog/m4-golden-suite.md) | Golden-file + CPU execution tests | highest — this is what makes an upstream bump safe |
+| [`list-mapping-support.md`](backlog/list-mapping-support.md) | The 27 nodes `invoke()` refuses | on demand — only if you need one |
+| [`http-backend.md`](backlog/http-backend.md) | Out-of-process backend | low — deferred by design |
+| [`generated-code-mutable-defaults.md`](backlog/generated-code-mutable-defaults.md) | `codec={'codec': 'auto'}` smell | cosmetic |
+| [`output-directory-and-d11.md`](backlog/output-directory-and-d11.md) | Outputs land in the ComfyUI checkout | needs a decision, not code |
 
 ## License
 

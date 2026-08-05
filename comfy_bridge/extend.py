@@ -1,4 +1,4 @@
-"""Local extensions: our own nodes, and reversible patches to ComfyUI (spec D13).
+"""Local extensions: our own nodes, and reversible patches to ComfyUI (D13).
 
 D11 said "extending ComfyUI is fine; mutating it is not", and M0's test asserted
 that literally — nothing in ``comfy.*`` may be reassigned. Optimization work
@@ -24,7 +24,7 @@ Custom nodes are registered into the Runtime's node table, which is a *copy* of
 ``nodes.NODE_CLASS_MAPPINGS`` — so registering ours cannot corrupt ComfyUI's, and
 comfy-codegen picks them up for free because it resolves classes through
 ``node_class()`` (see comfy_codegen/parse.py:121). Third-party custom nodes
-remain out of scope forever (spec D2); this is for code we write.
+remain out of scope forever (D2); this is for code we write.
 """
 
 from __future__ import annotations
@@ -54,9 +54,11 @@ __all__ = [
 #: class_type -> class, for everything registered through this module.
 _REGISTERED: dict[str, Any] = {}
 
-#: class_type -> the shipped class a registration shadowed, so unregister_node
-#: can put it back.
-_SHADOWED: dict[str, Any] = {}
+#: class_type -> (shipped class, its display name) that a registration shadowed,
+#: so unregister_node can put both back. The display name has to be kept here
+#: too: register_node overwrites runtime.display_names, and ComfyUI's own name
+#: ("Empty Latent Image") is not recoverable from the class afterwards.
+_SHADOWED: dict[str, tuple[Any, str | None]] = {}
 
 
 def _validate_node_class(cls: Any, class_type: str) -> None:
@@ -105,7 +107,7 @@ def _validate_node_class(cls: Any, class_type: str) -> None:
         raise ExtensionError(
             f"{class_type}: declares a V3 entrypoint but has no PREPARE_CLASS_CLONE. "
             "Subclass comfy_api.latest.ComfyNode rather than imitating its surface "
-            "(spec C31), or use the V1 shape."
+            "(C31), or use the V1 shape."
         )
 
     names = getattr(cls, "RETURN_NAMES", None)
@@ -115,7 +117,7 @@ def _validate_node_class(cls: Any, class_type: str) -> None:
             f"has {len(return_types)}"
         )
 
-    # Same refusal invoke() would make later, surfaced now (spec C17).
+    # Same refusal invoke() would make later, surfaced now (C17).
     list_io_guard(cls, class_type)
 
 
@@ -164,7 +166,7 @@ def register_node(
                 "replace=True if shadowing it is the intent."
             )
         if name not in _SHADOWED and name not in _REGISTERED:
-            _SHADOWED[name] = existing
+            _SHADOWED[name] = (existing, runtime.display_names.get(name))
             log.warning("local node %r now shadows the shipped %r", name, existing)
 
     runtime.nodes[name] = cls
@@ -181,13 +183,17 @@ def unregister_node(class_type: str) -> None:
     if class_type not in _REGISTERED:
         raise ExtensionError(f"{class_type!r} was not registered by register_node()")
     del _REGISTERED[class_type]
-    original = _SHADOWED.pop(class_type, None)
-    if original is None:
+    shadowed = _SHADOWED.pop(class_type, None)
+    if shadowed is None:
         runtime.nodes.pop(class_type, None)
         runtime.display_names.pop(class_type, None)
+        return
+    original, display_name = shadowed
+    runtime.nodes[class_type] = original
+    if display_name is None:
+        runtime.display_names.pop(class_type, None)
     else:
-        runtime.nodes[class_type] = original
-        runtime.display_names[class_type] = getattr(original, "__name__", class_type)
+        runtime.display_names[class_type] = display_name
 
 
 def registered_nodes() -> dict[str, Any]:
@@ -254,22 +260,36 @@ class Patch:
         log.debug("patched %s", self.name)
         return self
 
-    def revert(self) -> None:
+    def revert(self, *, force: bool = False) -> None:
         """Restore the original value, or remove the attribute if there was none.
 
-        Warns if something else replaced the attribute after we did — reverting
-        then silently discards the other patch, which during a benchmark sweep is
-        the kind of thing that produces numbers nobody can reproduce.
+        **Refuses to revert out of order.** If something replaced the attribute
+        after we did, this patch no longer knows the current value's provenance:
+        restoring ``_original`` would discard the newer patch *and* leave that
+        patch's value applied while :func:`active_patches` reports the process
+        clean. That combination is how a benchmark sweep produces numbers nobody
+        can reproduce, so it raises instead.
+
+            a = patch_attr(mod, "x", "A").apply()
+            b = patch_attr(mod, "x", "B").apply()
+            a.revert()          # ExtensionError — b is still on top
+            revert_all_patches()  # correct: newest first
+
+        Use :func:`revert_all_patches` (or a :class:`PatchSet`) to unwind a stack
+        in the right order. ``force=True`` reverts anyway, for the case where the
+        foreign change is known and intended.
         """
         if not self._applied:
             return
         current = getattr(self.target, self.attr, _MISSING)
-        if current is not self.value:
-            log.warning(
-                "%s changed since it was patched (found %r); reverting anyway will "
-                "discard that change",
-                self.name,
-                current,
+        if current is not self.value and not force:
+            raise ExtensionError(
+                f"{self.name} changed since it was patched (found {current!r}, "
+                f"expected {self.value!r}) — most likely another patch is stacked "
+                "on top of it. Reverting now would discard that patch and leave "
+                "its value applied with nothing recording it. Revert newest-first "
+                "(revert_all_patches() does this), or pass force=True if "
+                "discarding the newer value is what you mean."
             )
         if self._original is _MISSING:
             try:
@@ -332,8 +352,10 @@ class PatchSet:
                 patch.apply()
                 done.append(patch)
         except Exception:
+            # Rollback must not fail: a revert raising here would mask the error
+            # that caused the rollback and leave the set half-applied.
             for patch in reversed(done):
-                patch.revert()
+                patch.revert(force=True)
             raise
         return self
 
@@ -364,9 +386,26 @@ def active_patches() -> tuple[Patch, ...]:
 
 
 def revert_all_patches() -> int:
-    """Revert every applied patch, newest first. Returns how many were undone."""
+    """Revert every applied patch, newest first. Returns how many were undone.
+
+    This is the sanctioned way to get back to a clean process, and newest-first
+    is the order that makes a stack of patches on one attribute unwind correctly.
+    Because reaching a clean state is the postcondition callers depend on — test
+    teardown, the gap between two benchmark configurations — it forces through
+    any value that drifted, logging each one rather than stopping half-unwound.
+    Drift here means something mutated an attribute outside the ledger, which is
+    worth seeing but not worth leaving the process half-patched over.
+    """
     count = 0
     for patch in reversed(list(_ACTIVE)):
-        patch.revert()
+        current = getattr(patch.target, patch.attr, _MISSING)
+        if current is not patch.value:
+            log.warning(
+                "%s drifted before revert_all_patches (found %r); restoring the "
+                "pre-patch value anyway",
+                patch.name,
+                current,
+            )
+        patch.revert(force=True)
         count += 1
     return count

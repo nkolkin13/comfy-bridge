@@ -1,6 +1,8 @@
-"""M1 tests — the invoke() shim and manual memory control (spec §7, §5.3)."""
+"""M1 tests — the invoke() shim and manual memory control (§7, §5.3)."""
 
 from __future__ import annotations
+
+import types
 
 import pytest
 
@@ -34,12 +36,48 @@ def test_v3_node(runtime):
 
 
 def test_v3_hidden_inputs_are_populated(runtime):
-    """Spec C31 — the raw class has hidden=None and would AttributeError."""
+    """Spec C31 — the raw class has hidden=None and would AttributeError.
+
+    Asserted *through* invoke(), because the thing worth protecting is that
+    invoke() makes the clone. Reading PREPARE_CLASS_CLONE directly tests
+    ComfyUI, and would keep passing if invoke() stopped calling it.
+    """
     raw = comfy_bridge.node_class("SaveVideo")
-    assert getattr(raw, "hidden", None) is None
-    clone = raw.PREPARE_CLASS_CLONE(None)
-    assert clone.hidden is not None
-    assert clone.hidden.extra_pnginfo is None  # present, not raising
+    assert getattr(raw, "hidden", None) is None, "upstream now populates hidden"
+
+    seen = {}
+
+    class Probe:
+        """Stands in for a node that reads cls.hidden.* during execute."""
+
+        FUNCTION = "EXECUTE_NORMALIZED"
+        RETURN_TYPES = ()
+        hidden = None
+
+        @classmethod
+        def PREPARE_CLASS_CLONE(cls, v3_data):
+            clone = type("Clone", (cls,), {"hidden": raw.PREPARE_CLASS_CLONE(None).hidden})
+            seen["clone"] = clone
+            return clone
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {}}
+
+        @classmethod
+        def EXECUTE_NORMALIZED(cls):
+            # Would raise AttributeError if invoke() called the raw class.
+            seen["extra_pnginfo"] = cls.hidden.extra_pnginfo
+            return types.SimpleNamespace(result=(), block_execution=None, expand=None)
+
+    runtime.nodes["_BridgeHiddenProbe"] = Probe
+    try:
+        comfy_bridge.invoke("_BridgeHiddenProbe")
+    finally:
+        del runtime.nodes["_BridgeHiddenProbe"]
+
+    assert "clone" in seen, "invoke() did not call PREPARE_CLASS_CLONE"
+    assert seen["extra_pnginfo"] is None  # present, not raising
 
 
 def test_no_shipped_node_has_an_async_entrypoint(runtime):
@@ -64,14 +102,31 @@ def test_no_shipped_node_has_an_async_entrypoint(runtime):
     )
 
 
-def test_invoke_awaits_coroutines():
-    """Cover the await path directly, since no shipped node exercises it."""
-    from comfy_bridge.bootstrap import get_runtime
+def test_invoke_refuses_a_coroutine(runtime):
+    """C18 measured zero async entrypoints, so the shim refuses rather than awaits.
 
-    async def coro():
-        return ("awaited",)
+    Without this, a node that went async upstream would return a coroutine
+    object that flows downstream as though it were a tensor and fails somewhere
+    unrelated.
+    """
 
-    assert get_runtime().loop.run_until_complete(coro()) == ("awaited",)
+    class AsyncNode:
+        FUNCTION = "run"
+        RETURN_TYPES = ("FLOAT",)
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {}}
+
+        async def run(self):
+            return (1.0,)
+
+    runtime.nodes["_BridgeAsyncProbe"] = AsyncNode
+    try:
+        with pytest.raises(comfy_bridge.UnsupportedNodeError, match="coroutine"):
+            comfy_bridge.invoke("_BridgeAsyncProbe")
+    finally:
+        del runtime.nodes["_BridgeAsyncProbe"]
 
 
 def test_unknown_node_raises(runtime):
@@ -87,10 +142,27 @@ def test_node_error_carries_class_type(runtime):
     assert excinfo.value.original is not None
 
 
+def test_node_error_carries_the_workflow_node_id(runtime):
+    """A graph with six CLIPTextEncodes needs to say *which* one failed."""
+    with pytest.raises(comfy_bridge.NodeExecutionError) as excinfo:
+        comfy_bridge.invoke(
+            "EmptyLatentImage", "105:24", width="not-an-int", height=64, batch_size=1
+        )
+    assert excinfo.value.node_id == "105:24"
+    assert excinfo.value.class_type == "EmptyLatentImage"
+    assert "105:24" in str(excinfo.value)
+
+
+def test_node_id_defaults_to_class_type(runtime):
+    with pytest.raises(comfy_bridge.NodeExecutionError) as excinfo:
+        comfy_bridge.invoke("EmptyLatentImage", width="not-an-int", height=64, batch_size=1)
+    assert excinfo.value.node_id == "EmptyLatentImage"
+
+
 # --- guards --------------------------------------------------------------
 
 
-#: Shipped nodes that genuinely use list mapping (spec C17, corrected).
+#: Shipped nodes that genuinely use list mapping (C17, corrected).
 #: invoke() refuses these; they are a documented §9 limitation, not a bug.
 #: Pinned so the set changing on an upstream bump is visible rather than silent.
 KNOWN_LIST_IO_NODES = 27
@@ -147,7 +219,7 @@ def test_invoke_disables_autograd(runtime):
     assert not latent["samples"].requires_grad
 
 
-# --- memory (spec §5.3) --------------------------------------------------
+# --- memory (§5.3) --------------------------------------------------
 
 
 def test_as_patcher_handles_both_wrapper_shapes(runtime):
@@ -161,8 +233,25 @@ def test_as_patcher_handles_both_wrapper_shapes(runtime):
     assert as_patcher(None) is None
 
 
-def test_offload_ignores_non_models(runtime):
-    assert comfy_bridge.offload(None, "not a model", 42) == 0
+def test_hooks_and_memory_share_one_patcher_resolver():
+    """Two implementations that disagreed is how the VAE bug comes back."""
+    from comfy_bridge import hooks, memory
+
+    assert hooks._as_patcher.__module__ == "comfy_bridge.hooks"
+    with pytest.raises(comfy_bridge.ExtensionError) as from_hooks:
+        hooks._as_patcher("not a model", "add_wrapper")
+    with pytest.raises(comfy_bridge.ExtensionError) as from_memory:
+        memory.require_patcher("not a model", "add_wrapper")
+    assert str(from_hooks.value) == str(from_memory.value)
+
+
+def test_offload_skips_none_but_refuses_a_non_model(runtime):
+    """An offload that quietly did nothing shows up later as unexplained VRAM."""
+    assert comfy_bridge.offload(None, None) == 0
+    with pytest.raises(comfy_bridge.ExtensionError, match="offload"):
+        comfy_bridge.offload("not a model")
+    with pytest.raises(comfy_bridge.ExtensionError, match="load_to_gpu"):
+        comfy_bridge.load_to_gpu(42)
 
 
 # --- the D11 invariant ---------------------------------------------------

@@ -16,6 +16,7 @@ from .bootstrap import (
     DEFAULT_COMFY_ROOT,
     FOOTPRINT,
     FOOTPRINT_REAL_SERVER,
+    INJECTED,
     VALIDATED_COMFY_VERSION,
     VRAM_MODES,
     Runtime,
@@ -44,12 +45,13 @@ from .extend import (
     unregister_node,
 )
 from .invoke import add_observer, invoke, node_class
-from .memory import free_memory, load_to_gpu, offload
+from .memory import as_patcher, free_memory, load_to_gpu, offload, require_patcher
 
 __all__ = [
     "DEFAULT_COMFY_ROOT",
     "FOOTPRINT",
     "FOOTPRINT_REAL_SERVER",
+    "INJECTED",
     "VALIDATED_COMFY_VERSION",
     "VRAM_MODES",
     "BootstrapError",
@@ -64,6 +66,7 @@ __all__ = [
     "UnsupportedNodeError",
     "active_patches",
     "add_observer",
+    "as_patcher",
     "bench",
     "extend",
     "free_memory",
@@ -77,6 +80,7 @@ __all__ = [
     "patch_attr",
     "register_node",
     "registered_nodes",
+    "require_patcher",
     "revert_all_patches",
     "start",
     "unregister_node",

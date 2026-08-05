@@ -1,4 +1,4 @@
-"""Exception hierarchy for comfy_bridge (spec §8)."""
+"""Exception hierarchy for comfy_bridge (§8)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ class BootstrapError(ComfyBridgeError):
 
 
 class NamespaceError(ComfyBridgeError):
-    """The sys.modules footprint guard tripped (spec §5.1 step 11)."""
+    """The sys.modules footprint guard tripped (§5.1 step 11)."""
 
     def __init__(self, unexpected: set[str], missing: set[str]) -> None:
         parts = []
@@ -39,7 +39,7 @@ class CodegenError(ComfyBridgeError):
 
 
 class UnsupportedNodeError(CodegenError):
-    """A node uses a feature static generation cannot express (spec §9)."""
+    """A node uses a feature static generation cannot express (§9)."""
 
 
 class NodeExecutionError(ComfyBridgeError):

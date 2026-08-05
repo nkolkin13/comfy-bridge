@@ -83,6 +83,7 @@ def test_register_node_works_as_a_decorator(runtime):
 
 def test_shadowing_a_shipped_node_needs_replace_and_restores(runtime):
     original = runtime.nodes["CLIPTextEncode"]
+    original_display = runtime.display_names["CLIPTextEncode"]
 
     with pytest.raises(ExtensionError, match="already registered"):
         comfy_bridge.register_node(DoubleFloat, class_type="CLIPTextEncode")
@@ -91,6 +92,9 @@ def test_shadowing_a_shipped_node_needs_replace_and_restores(runtime):
     assert runtime.nodes["CLIPTextEncode"] is DoubleFloat
     comfy_bridge.unregister_node("CLIPTextEncode")
     assert runtime.nodes["CLIPTextEncode"] is original
+    # ComfyUI's display name ("CLIP Text Encode (Prompt)") is not recoverable
+    # from the class, so register_node has to stash it alongside the class.
+    assert runtime.display_names["CLIPTextEncode"] == original_display
 
 
 @pytest.mark.parametrize(
@@ -192,6 +196,50 @@ def test_revert_all_patches_returns_count():
     comfy_bridge.patch_attr(module, "b", 20).apply()
     assert comfy_bridge.revert_all_patches() == 2
     assert (module.a, module.b) == (1, 2)
+
+
+def test_out_of_order_revert_is_refused():
+    """The failure this guards is silent, which is why it must not be a warning.
+
+    Reverting the outer patch first restores its remembered original — which is
+    the *inner* patch's value — and drops both from the ledger. The result is a
+    mutated process that active_patches() reports as clean, i.e. the one thing
+    the D13 bargain promises cannot happen.
+    """
+    module = types.SimpleNamespace(x="ORIGINAL")
+    outer = comfy_bridge.patch_attr(module, "x", "A").apply()
+    inner = comfy_bridge.patch_attr(module, "x", "B").apply()
+
+    with pytest.raises(ExtensionError, match="stacked"):
+        outer.revert()
+
+    assert module.x == "B", "the refused revert must change nothing"
+    assert len(comfy_bridge.active_patches()) == 2
+
+    inner.revert()
+    outer.revert()
+    assert module.x == "ORIGINAL"
+    assert comfy_bridge.active_patches() == ()
+
+
+def test_revert_all_unwinds_a_stack_in_the_right_order():
+    module = types.SimpleNamespace(x="ORIGINAL")
+    comfy_bridge.patch_attr(module, "x", "A").apply()
+    comfy_bridge.patch_attr(module, "x", "B").apply()
+
+    assert comfy_bridge.revert_all_patches() == 2
+    assert module.x == "ORIGINAL"
+    assert comfy_bridge.active_patches() == ()
+
+
+def test_forced_revert_escapes_the_ordering_check():
+    module = types.SimpleNamespace(x="ORIGINAL")
+    patch = comfy_bridge.patch_attr(module, "x", "A").apply()
+    module.x = "SOMETHING ELSE"  # a mutation outside the ledger
+
+    patch.revert(force=True)
+    assert module.x == "ORIGINAL"
+    assert comfy_bridge.active_patches() == ()
 
 
 def test_patching_comfyui_is_contained(runtime):
@@ -337,7 +385,7 @@ def test_time_model_calls_records_each_forward():
 
 
 def test_wrapper_types_match_upstream(runtime):
-    """Fail loudly if upstream renames a wrapper point (spec §10)."""
+    """Fail loudly if upstream renames a wrapper point (§10)."""
     from comfy.patcher_extension import WrappersMP
 
     assert hooks.OUTER_SAMPLE == WrappersMP.OUTER_SAMPLE

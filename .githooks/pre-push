@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+#
+# Pre-push: run the suite and keep it fast.
+#
+# The suite starts ComfyUI and allocates real VRAM, so this refuses to run
+# against a busy card (see tests/conftest.py). Bypass the whole hook with
+# `git push --no-verify`, or allow a busy GPU with COMFY_BRIDGE_ALLOW_BUSY_GPU=1.
+#
+# Thresholds apply to each test's *call* phase only, never to setup or teardown.
+# The session fixture that boots ComfyUI takes ~6s on its own and is charged to
+# whichever test happens to be first; failing on that would fail every push.
+
+set -uo pipefail
+
+WARN_SECONDS="${COMFY_BRIDGE_WARN_SECONDS:-1.0}"
+FAIL_SECONDS="${COMFY_BRIDGE_FAIL_SECONDS:-5.0}"
+
+# The project targets the gygax conda env — it is the one that satisfies
+# ComfyUI's torch. Override with COMFY_BRIDGE_PYTHON if that ever moves.
+PYTHON="${COMFY_BRIDGE_PYTHON:-$HOME/miniconda3/envs/gygax/bin/python}"
+
+if [[ ! -x "$PYTHON" ]]; then
+    echo "pre-push: no interpreter at $PYTHON" >&2
+    echo "          set COMFY_BRIDGE_PYTHON, or push with --no-verify." >&2
+    exit 1
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT" || exit 1
+
+echo "pre-push: running the suite ($("$PYTHON" --version 2>&1))"
+
+OUTPUT="$("$PYTHON" -m pytest -q --durations=0 2>&1)"
+STATUS=$?
+
+echo "$OUTPUT" | grep -vE "^[0-9.]+s (setup|teardown|call) " | sed '/^$/d'
+
+if [[ $STATUS -ne 0 ]]; then
+    echo ""
+    echo "pre-push: tests failed — push aborted." >&2
+    exit 1
+fi
+
+echo ""
+echo "$OUTPUT" | awk -v warn="$WARN_SECONDS" -v fail="$FAIL_SECONDS" '
+    # pytest --durations lines look like: "0.12s call     tests/test_x.py::test_y"
+    $2 == "call" {
+        secs = $1; sub(/s$/, "", secs); secs = secs + 0
+        if (secs >= fail) { failures[nf++] = sprintf("  %6.2fs  %s", secs, $3) }
+        else if (secs >= warn) { warnings[nw++] = sprintf("  %6.2fs  %s", secs, $3) }
+    }
+    END {
+        if (nw > 0) {
+            printf "pre-push: %d test(s) slower than %ss:\n", nw, warn
+            for (i = 0; i < nw; i++) print warnings[i]
+        }
+        if (nf > 0) {
+            printf "pre-push: %d test(s) slower than %ss — push aborted.\n", nf, fail
+            for (i = 0; i < nf; i++) print failures[i]
+            print ""
+            print "  These guards are meant to run on every commit. Speed the test up,"
+            print "  or move the expensive part behind a fixture the rest can share."
+            exit 1
+        }
+        if (nw == 0) printf "pre-push: all tests under %ss.\n", warn
+    }
+'
+exit $?

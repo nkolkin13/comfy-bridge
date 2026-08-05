@@ -57,5 +57,5 @@ MiniMax workflow as part of the upgrade ritual.
 ## Watch out
 
 `bootstrap.py` pins `VALIDATED_COMFY_VERSION = "0.30.0"` and *warns* rather than
-fails when the checkout moves (spec §10). That warning is currently the only
+fails when the checkout moves (§10). That warning is currently the only
 upstream-drift signal. Golden files are what turn it into something actionable.

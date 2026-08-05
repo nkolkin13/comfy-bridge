@@ -32,7 +32,7 @@ one still stands unambiguously:
 
 ## Sketch
 
-Reintroduce the backend abstraction from spec v1 §4.2 (dropped in v2):
+Reintroduce the backend abstraction from the v1 design (dropped in v2):
 
 ```python
 class Backend(Protocol):

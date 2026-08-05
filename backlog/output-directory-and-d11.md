@@ -47,6 +47,6 @@ matching comment if redirect becomes the convention.
 
 - [ ] Decide
 - [ ] If redirecting: pick a location, update `examples/minimax_h3_t2v.py` and
-      `emit.py`'s `__main__` block, note it in the spec under D11
+      `emit.py`'s `__main__` block, note it in CLAUDE.md under D11
 - [ ] If not: add a sentence to D11 clarifying that `output/`, `temp/` and
       `input/` are data directories and explicitly outside the invariant

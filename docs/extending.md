@@ -1,7 +1,7 @@
 # Extending the bridge: custom nodes, architecture patches, inference patches
 
 Written for the acceleration work (Step 0). Everything here is for **code we
-write**. Third-party custom nodes remain out of scope forever (spec D2).
+write**. Third-party custom nodes remain out of scope forever (D2).
 
 The headline: **most of what acceleration work needs already exists**, because
 ComfyUI ships a wrapper/callback system that reaches every level a zero-knowledge
@@ -26,7 +26,7 @@ makes A/B benchmarking trustworthy, and it is why the table is ordered this way.
 Modules that `import comfy.*` must be imported **after** `comfy_bridge.start()`.
 Before that, ComfyUI is not on `sys.path` at all — and after `start()` returns,
 the path entry is removed again, so only names already in `sys.modules` resolve
-(spec C11).
+(C11).
 
 Two ways to stay safe:
 
@@ -125,7 +125,7 @@ class Int8Linear:
 The contract is checked at registration, not three hours into a run:
 `INPUT_TYPES()`, `RETURN_TYPES`, `FUNCTION` naming a real attribute, and
 `RETURN_NAMES` matching in length. List I/O is refused, same as for shipped nodes
-(spec C17).
+(C17).
 
 Registration writes to the Runtime's node table, which is a copy — ComfyUI's own
 `NODE_CLASS_MAPPINGS` is never touched. comfy-codegen resolves classes through
@@ -190,7 +190,7 @@ believe the device.
 
 ## Known sharp edge: inference tensors
 
-Generated `run_graph()` carries `@torch.inference_mode()` (spec C29) — without
+Generated `run_graph()` carries `@torch.inference_mode()` (C29) — without
 it, VRAM climbs until it OOMs, so it is not optional. But tensors created under
 inference mode are *inference tensors*, and custom kernels that stash a tensor
 for reuse across calls — exactly what step-caching does — can trip errors when

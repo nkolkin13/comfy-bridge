@@ -1,4 +1,4 @@
-"""Inference hooks that go through ComfyUI's own extension API (spec D13).
+"""Inference hooks that go through ComfyUI's own extension API (D13).
 
 The headline finding from surveying the checkout: **most inference-level
 acceleration needs no patching at all.** ComfyUI ships a wrapper/callback system
@@ -96,16 +96,17 @@ _WRAPPER_TYPES = frozenset(
 
 
 def _as_patcher(model: Any, what: str) -> Any:
-    """Accept a ModelPatcher, or anything wrapping one (comfy.sd.VAE, CLIP)."""
-    if hasattr(model, "add_wrapper") and hasattr(model, "clone"):
-        return model
-    inner = getattr(model, "patcher", None)
-    if inner is not None and hasattr(inner, "add_wrapper"):
-        return inner
-    raise ExtensionError(
-        f"{what} needs a ModelPatcher (or an object with .patcher), got "
-        f"{type(model).__name__}"
-    )
+    """Resolve a ModelPatcher, raising if there is none.
+
+    Delegates to :mod:`comfy_bridge.memory` — one resolver for the package. This
+    used to be a second implementation with the opposite precedence (duck-typed
+    first, ``.patcher`` second). Both agreed on every real shape, but keeping two
+    of them around is how the "naive check silently skips every VAE" bug gets
+    written a third time.
+    """
+    from .memory import require_patcher
+
+    return require_patcher(model, what)
 
 
 def add_wrapper(
